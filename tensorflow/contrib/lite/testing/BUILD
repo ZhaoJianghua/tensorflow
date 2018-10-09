@@ -7,12 +7,13 @@ licenses(["notice"])  # Apache 2.0
 load(
     "//tensorflow/contrib/lite:build_def.bzl",
     "gen_zip_test",
-    "generated_test_models",
+    "generated_test_models_all",
 )
 load("//tensorflow/contrib/lite:special_rules.bzl", "tflite_portable_test_suite")
 load(
     "//tensorflow:tensorflow.bzl",
     "tf_cc_test",
+    "py_test",
 )
 
 [gen_zip_test(
@@ -29,14 +30,15 @@ load(
             "--unzip_binary_path=/usr/bin/unzip",
         ],
     }),
+    conversion_mode = conversion_mode,
     data = [
         ":zip_%s" % test_name,
     ],
     shard_count = 20,
-    tags = [
+    tags = tags + [
         "gen_zip_test",
         "no_oss",
-        "tflite_not_portable",
+        "tflite_not_portable_intentional",
     ],
     test_name = test_name,
     deps = [
@@ -59,7 +61,7 @@ load(
             "//tensorflow/core:android_tensorflow_test_lib",
         ],
     }),
-) for test_name in generated_test_models()]
+) for conversion_mode, test_name, tags in generated_test_models_all()]
 
 test_suite(
     name = "generated_zip_tests",
@@ -112,7 +114,6 @@ cc_library(
 cc_test(
     name = "message_test",
     srcs = ["message_test.cc"],
-    tags = ["no_oss"],
     deps = [
         ":message",
         "@com_google_googletest//:gtest_main",
@@ -132,7 +133,6 @@ cc_test(
     name = "split_test",
     size = "small",
     srcs = ["split_test.cc"],
-    tags = ["no_oss"],
     deps = [
         ":split",
         "@com_google_googletest//:gtest_main",
@@ -142,13 +142,13 @@ cc_test(
 cc_library(
     name = "join",
     hdrs = ["join.h"],
+    deps = ["//tensorflow/contrib/lite:string"],
 )
 
 cc_test(
     name = "join_test",
     size = "small",
     srcs = ["join_test.cc"],
-    tags = ["no_oss"],
     deps = [
         ":join",
         "@com_google_googletest//:gtest_main",
@@ -164,17 +164,17 @@ cc_library(
         ":test_runner",
         "//tensorflow/contrib/lite:builtin_op_data",
         "//tensorflow/contrib/lite:framework",
+        "//tensorflow/contrib/lite/delegates/flex:delegate",
         "//tensorflow/contrib/lite/kernels:builtin_ops",
     ],
 )
 
-cc_test(
+tf_cc_test(
     name = "tflite_driver_test",
     size = "small",
     srcs = ["tflite_driver_test.cc"],
     data = ["//tensorflow/contrib/lite:testdata/multi_add.bin"],
     tags = [
-        "no_oss",
         "tflite_not_portable_android",
         "tflite_not_portable_ios",
     ],
@@ -196,7 +196,6 @@ cc_library(
 cc_test(
     name = "tokenize_test",
     srcs = ["tokenize_test.cc"],
-    tags = ["no_oss"],
     deps = [
         ":tokenize",
         "@com_google_googletest//:gtest_main",
@@ -214,12 +213,16 @@ cc_library(
 cc_library(
     name = "util",
     hdrs = ["util.h"],
+    deps = [
+        "//tensorflow/contrib/lite:framework",
+        "//tensorflow/contrib/lite:string",
+        "//tensorflow/contrib/lite/core/api",
+    ],
 )
 
 cc_test(
     name = "test_runner_test",
     srcs = ["test_runner_test.cc"],
-    tags = ["no_oss"],
     deps = [
         ":test_runner",
         "@com_google_googletest//:gtest_main",
@@ -275,6 +278,7 @@ cc_library(
         ":join",
         ":split",
         ":tf_driver",
+        "//tensorflow/contrib/lite:string",
         "//tensorflow/core:framework",
     ],
 )
@@ -341,7 +345,7 @@ tf_cc_test(
     ],
     tags = [
         "no_cuda_on_cpu_tap",
-        "no_oss",
+        "no_oss",  # needs test data
         "tflite_not_portable",
     ],
     deps = [
@@ -356,6 +360,34 @@ cc_binary(
     deps = [
         ":tflite_diff_flags",
         ":tflite_diff_util",
+    ],
+)
+
+py_binary(
+    name = "model_coverage_lib",
+    srcs = ["//tensorflow/contrib/lite/testing:model_coverage/model_coverage_lib.py"],
+    srcs_version = "PY2AND3",
+    tags = ["no_pip"],
+    visibility = ["//tensorflow/contrib/lite:__subpackages__"],
+    deps = [
+        "//tensorflow/contrib/lite/python:lite",
+        "//tensorflow/python:platform",
+    ],
+)
+
+py_test(
+    name = "model_coverage_lib_test",
+    srcs = ["//tensorflow/contrib/lite/testing:model_coverage/model_coverage_lib_test.py"],
+    srcs_version = "PY2AND3",
+    tags = [
+        "no_oss",
+        "no_pip",
+        "no_windows",
+        "notap",
+    ],
+    deps = [
+        ":model_coverage_lib",
+        "//tensorflow/python:client_testlib",
     ],
 )
 

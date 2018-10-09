@@ -23,7 +23,8 @@ limitations under the License.
 #include "tensorflow/contrib/lite/model.h"
 
 #include <gtest/gtest.h>
-#include "tensorflow/contrib/lite/error_reporter.h"
+#include "tensorflow/contrib/lite/core/api/error_reporter.h"
+#include "tensorflow/contrib/lite/kernels/register.h"
 #include "tensorflow/contrib/lite/testing/util.h"
 
 // Comparison for TfLiteRegistration. Since TfLiteRegistration is a C object,
@@ -193,6 +194,27 @@ TEST(BasicFlatBufferModel, TestModelInInterpreter) {
   }
 }
 
+// Test that loading a model with TensorFlow ops fails when the flex delegate is
+// not linked into the target.
+TEST(FlexModel, FailureWithoutFlexDelegate) {
+  auto model = FlatBufferModel::BuildFromFile(
+      "tensorflow/contrib/lite/testdata/multi_add_flex.bin");
+  ASSERT_TRUE(model);
+
+  // Note that creation will succeed when using the BuiltinOpResolver, but
+  // unless the appropriate delegate is linked into the target or the client
+  // explicitly installs the delegate, execution will fail.
+  std::unique_ptr<Interpreter> interpreter;
+  ASSERT_EQ(InterpreterBuilder(*model,
+                               ops::builtin::BuiltinOpResolver{})(&interpreter),
+            kTfLiteOk);
+  ASSERT_TRUE(interpreter);
+
+  // As the flex ops weren't resolved implicitly by the flex delegate, runtime
+  // allocation and execution will fail.
+  ASSERT_EQ(interpreter->AllocateTensors(), kTfLiteError);
+}
+
 // This tests on a flatbuffer that defines a shape of 2 to be a memory mapped
 // buffer. But the buffer is provided to be only 1 element.
 TEST(BasicFlatBufferModel, TestBrokenMmap) {
@@ -241,14 +263,6 @@ TEST(BasicFlatBufferModel, TestWithNullVerifier) {
       "tensorflow/contrib/lite/testdata/test_model.bin", nullptr));
 }
 
-struct TestErrorReporter : public ErrorReporter {
-  int Report(const char* format, va_list args) override {
-    calls++;
-    return 0;
-  }
-  int calls = 0;
-};
-
 // This makes sure the ErrorReporter is marshalled from FlatBufferModel to
 // the Interpreter.
 TEST(BasicFlatBufferModel, TestCustomErrorReporter) {
@@ -262,7 +276,7 @@ TEST(BasicFlatBufferModel, TestCustomErrorReporter) {
   TrivialResolver resolver;
   InterpreterBuilder(*model, resolver)(&interpreter);
   ASSERT_NE(interpreter->Invoke(), kTfLiteOk);
-  ASSERT_EQ(reporter.calls, 1);
+  ASSERT_EQ(reporter.num_calls(), 1);
 }
 
 // This makes sure the ErrorReporter is marshalled from FlatBufferModel to

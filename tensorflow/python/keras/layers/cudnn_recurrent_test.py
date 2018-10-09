@@ -26,6 +26,7 @@ import numpy as np
 from tensorflow.python import keras
 from tensorflow.python.framework import test_util
 from tensorflow.python.keras import testing_utils
+from tensorflow.python.ops import array_ops
 from tensorflow.python.platform import test
 from tensorflow.python.training.rmsprop import RMSPropOptimizer
 
@@ -142,6 +143,32 @@ class CuDNNTest(test.TestCase, parameterized.TestCase):
       ('cudnngru', keras.layers.CuDNNGRU),
       ('cudnnlstm', keras.layers.CuDNNLSTM),
   )
+  def test_time_major_input(self, layer_class):
+    if test.is_gpu_available(cuda_only=True):
+      with self.test_session(use_gpu=True):
+        input_size = 10
+        timesteps = 6
+        units = 2
+        num_samples = 32
+
+        model = keras.models.Sequential()
+        model.add(
+            keras.layers.Lambda(lambda t: array_ops.transpose(t, [1, 0, 2])))
+        layer = layer_class(units, time_major=True, return_sequences=True)
+        model.add(layer)
+        model.add(
+            keras.layers.Lambda(lambda t: array_ops.transpose(t, [1, 0, 2])))
+        model.compile(loss='categorical_crossentropy', optimizer='adam')
+        model.fit(
+            np.ones((num_samples, timesteps, input_size)),
+            np.ones((num_samples, timesteps, units)))
+        out = model.predict(np.ones((num_samples, timesteps, input_size)))
+        self.assertEqual(out.shape, (num_samples, timesteps, units))
+
+  @parameterized.named_parameters(
+      ('cudnngru', keras.layers.CuDNNGRU),
+      ('cudnnlstm', keras.layers.CuDNNLSTM),
+  )
   def test_specify_initial_state_keras_tensor(self, layer_class):
     if test.is_gpu_available(cuda_only=True):
       with self.test_session(use_gpu=True):
@@ -220,7 +247,7 @@ class CuDNNTest(test.TestCase, parameterized.TestCase):
         self.assertNotEqual(out4.max(), out5.max())
 
   @parameterized.named_parameters(
-      *testing_utils.generate_combinations_with_testcase_name(
+      *test_util.generate_combinations_with_testcase_name(
           rnn_type=['LSTM', 'GRU'], to_cudnn=[True, False],
           bidirectional=[True, False], implementation=[1, 2],
           model_nest_level=[1, 2], model_type=['seq', 'func']))
@@ -301,7 +328,7 @@ class CuDNNTest(test.TestCase, parameterized.TestCase):
     os.remove(fname)
 
   @parameterized.named_parameters(
-      *testing_utils.generate_combinations_with_testcase_name(
+      *test_util.generate_combinations_with_testcase_name(
           rnn_type=['LSTM', 'GRU'], to_cudnn=[True, False]))
   def test_load_weights_between_noncudnn_rnn_time_distributed(self, rnn_type,
                                                               to_cudnn):

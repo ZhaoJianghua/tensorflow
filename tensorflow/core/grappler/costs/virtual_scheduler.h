@@ -107,13 +107,14 @@ struct DeviceState {
       mem_usage_snapshot_at_peak;
 
   Costs device_costs;
-  std::map<string, Costs> op_to_cost;    // Per-op cost.
-  std::map<string, int64> op_to_memory;  // Per-op memory usage at peak usage.
-  int64 memory_usage;
-  int64 max_memory_usage;
+  std::map<string, Costs> op_to_cost;  // Per-op cost.
+
+  int64 memory_usage;      // Current temporary memory usage
+  int64 max_memory_usage;  // Max temporary memory usage
 
   DeviceState() {
     device_costs = Costs::ZeroCosts();
+    device_costs.num_ops_total = 0;
     memory_usage = 0;
     max_memory_usage = 0;
   }
@@ -275,19 +276,12 @@ class VirtualScheduler {
   // Return per device peak memory usage.
   const std::unordered_map<string, int64> GetPeakMemoryUsage() const;
 
- protected:
   const std::unordered_map<string, DeviceState>* GetDeviceStates() const {
     return &device_;
   }
   const std::unordered_map<const NodeDef*, NodeState>* GetNodeStates() const {
     return &node_map_;
   }
-
-  // Returns the size of output at port_num (unit: bytes). A special case is
-  // port_num -1, which is for control dependency and assumed to be 4 bytes.
-  int64 CalculateOutputSize(
-      const std::vector<OpInfo::TensorProperties>& output_properties,
-      const int port_num) const;
 
  private:
   // Constants.
@@ -320,8 +314,11 @@ class VirtualScheduler {
   std::vector<std::unique_ptr<NodeDef>> additional_nodes_;
 
   // Stats:
-  std::map<string, int> op_counts_;  // Op counts with key with input shape.
-  // Individual op costs (with input shapes).
+  // Op counts with key with input shape.
+  // Example key: "[Op=AssignSub, input_shapes=[[7,1,160,160][7,1,160,160]]"
+  std::map<string, int> op_counts_;
+  // Individual op costs with key with input shape.
+  // Integer field for execution time in micro seconds.
   // Boolean field for whether the cost is accurate.
   std::map<string, std::pair<int, bool>> op_costs_;
 

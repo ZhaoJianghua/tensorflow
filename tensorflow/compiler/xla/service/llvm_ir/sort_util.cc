@@ -16,17 +16,22 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/llvm_ir/sort_util.h"
 
 // IWYU pragma: no_include "llvm/IR/Intrinsics.gen.inc"
+#include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Value.h"
 #include "tensorflow/compiler/xla/primitive_util.h"
+#include "tensorflow/compiler/xla/service/gpu/parallel_loop_emitter.h"
+#include "tensorflow/compiler/xla/service/gpu/partition_assignment.h"
 #include "tensorflow/compiler/xla/service/llvm_ir/ir_array.h"
 #include "tensorflow/compiler/xla/service/llvm_ir/llvm_loop.h"
 #include "tensorflow/compiler/xla/service/llvm_ir/llvm_util.h"
+#include "tensorflow/compiler/xla/service/llvm_ir/loop_emitter.h"
 #include "tensorflow/compiler/xla/shape_util.h"
-#include "tensorflow/core/lib/core/bits.h"
 #include "tensorflow/core/lib/core/status.h"
-#include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/platform/types.h"
 
 namespace xla {
@@ -35,19 +40,18 @@ namespace llvm_ir {
 namespace {
 // Adds the inner comparison loop where we compare elements pointed to by
 // 'keys_index' and 'compare_keys_index'.
-void EmitCompareLoop(int64 dimension_to_sort,
-                     const llvm_ir::IrArray::Index& keys_index,
-                     const llvm_ir::IrArray::Index& compare_keys_index,
-                     const llvm_ir::IrArray& keys_array, llvm::IRBuilder<>* b) {
-  // TODO(b/26783907): parallelize this loop.
-
+void EmitCompareLoop(int64 dimension_to_sort, const IrArray::Index& keys_index,
+                     const IrArray::Index& compare_keys_index,
+                     const IrArray& keys_array,
+                     const absl::optional<IrArray>& values_array,
+                     llvm::IRBuilder<>* b) {
   // if (is_smaller_index &&
   //     compare_keys[dimension_to_sort] < dimension_to_sort_bound)
   llvm::Value* is_smaller_index = b->CreateICmpSLT(
       keys_index[dimension_to_sort], compare_keys_index[dimension_to_sort]);
   int64 dimension_to_sort_bound =
       keys_array.GetShape().dimensions(dimension_to_sort);
-  auto if_data = llvm_ir::EmitIfThenElse(
+  auto if_data = EmitIfThenElse(
       b->CreateAnd(is_smaller_index,
                    b->CreateICmpSLT(compare_keys_index[dimension_to_sort],
                                     keys_index.GetConstantWithIndexType(
@@ -56,38 +60,72 @@ void EmitCompareLoop(int64 dimension_to_sort,
   SetToFirstInsertPoint(if_data.true_block, b);
   auto key1 = keys_array.EmitReadArrayElement(keys_index, b);
   auto key2 = keys_array.EmitReadArrayElement(compare_keys_index, b);
+  auto compare_key1 = key1;
+  auto compare_key2 = key2;
   auto key_type = keys_array.GetShape().element_type();
+  bool is_signed_comparison = true;
+  if (primitive_util::IsFloatingPointType(key_type)) {
+    // We would like a total order of floating point numbers so that the sort
+    // has a predictable behavior in the presence of NaNs. Rather than using
+    // floating point comparison, we use the following trick:
+    // If f is a float, and
+    // x = bit_cast<int32>(f);
+    // y = x < 0 ? 0x7FFFFFFF - x : x;
+    // then y is ordered as an int32 such that finite values have the obvious
+    // order, -0 is ordered before 0, and -NaN and NaN appear at the beginning
+    // and end of the ordering.
+    auto k = b->getInt(llvm::APInt::getSignedMaxValue(
+        key1->getType()->getPrimitiveSizeInBits()));
+    auto comparison_type = k->getType();
+    auto zero = llvm::ConstantInt::get(comparison_type, 0);
+    auto maybe_flip = [&](llvm::Value* v) {
+      return b->CreateSelect(b->CreateICmp(llvm::ICmpInst::ICMP_SLT, v, zero),
+                             b->CreateSub(k, v), v);
+    };
+    compare_key1 = b->CreateBitCast(key1, comparison_type);
+    compare_key2 = b->CreateBitCast(key2, comparison_type);
+    compare_key1 = maybe_flip(compare_key1);
+    compare_key2 = maybe_flip(compare_key2);
+  } else if (!primitive_util::IsSignedIntegralType(key_type)) {
+    is_signed_comparison = false;
+  }
   auto comparison =
-      primitive_util::IsFloatingPointType(key_type)
-          // TODO(b/26783907): Figure out how to handle NaNs.
-          ? b->CreateFCmp(llvm::FCmpInst::FCMP_ULT, key1, key2)
-          : b->CreateICmp(primitive_util::IsSignedIntegralType(key_type)
-                              ? llvm::ICmpInst::ICMP_SLT
-                              : llvm::ICmpInst::ICMP_ULT,
-                          key1, key2);
-  auto min_key = b->CreateSelect(comparison, key1, key2);
-  auto max_key = b->CreateSelect(comparison, key2, key1);
-  keys_array.EmitWriteArrayElement(keys_index, min_key, b);
-  keys_array.EmitWriteArrayElement(compare_keys_index, max_key, b);
+      b->CreateICmp(is_signed_comparison ? llvm::ICmpInst::ICMP_SLT
+                                         : llvm::ICmpInst::ICMP_ULT,
+                    compare_key2, compare_key1);
+  // If key2 < key1
+  auto if_smaller_data =
+      EmitIfThenElse(comparison, "is_smaller_than", b, /*emit_else=*/false);
+  SetToFirstInsertPoint(if_smaller_data.true_block, b);
+  // Swap key1 with key2.
+  keys_array.EmitWriteArrayElement(keys_index, key2, b);
+  keys_array.EmitWriteArrayElement(compare_keys_index, key1, b);
+  if (values_array.has_value()) {
+    // Also swap the values.
+    auto value1 = values_array.value().EmitReadArrayElement(keys_index, b);
+    auto value2 =
+        values_array.value().EmitReadArrayElement(compare_keys_index, b);
+    values_array.value().EmitWriteArrayElement(keys_index, value2, b);
+    values_array.value().EmitWriteArrayElement(compare_keys_index, value1, b);
+  }
 }
 }  // namespace
 
 Status EmitSortInPlace(int64 dimension_to_sort, const IrArray& keys_array,
-                       tensorflow::StringPiece name, llvm::IRBuilder<>* b) {
+                       const absl::optional<IrArray>& values_array,
+                       absl::string_view name, llvm::Value* xor_mask,
+                       llvm::IRBuilder<>* b,
+                       const gpu::LaunchDimensions* launch_dimensions) {
   const Shape& keys_shape = keys_array.GetShape();
 
-  // TODO(b/26783907): This case can probably be avoided with the Algebraic
-  // Simplifier.
-  if (ShapeUtil::IsScalar(keys_shape)) {
-    return Status::OK();
-  }
-
   // Create loop nests which loop through the operand dimensions. The sort
-  // dimension is handled in three separate innermost loops which perform the
-  // sorting.
+  // dimension is handled in the innermost loop which performs the sorting.
   ForLoopNest loop_nest(name, b);
   IrArray::Index keys_index =
       loop_nest.EmitOperandArrayLoopNest(keys_array, dimension_to_sort, "keys");
+  if (loop_nest.GetInnerLoopBodyBasicBlock() != nullptr) {
+    SetToFirstInsertPoint(loop_nest.GetInnerLoopBodyBasicBlock(), b);
+  }
 
   // 'compare_keys_index' is the index of the element that 'keys_index' should
   // be compared to.
@@ -100,89 +138,42 @@ Status EmitSortInPlace(int64 dimension_to_sort, const IrArray& keys_array,
     }
   }
 
-  // Create the sorting loops which do the sorting.
-  int64 dimension_to_sort_bound = keys_shape.dimensions(dimension_to_sort);
-  std::unique_ptr<ForLoop> stages_loop = loop_nest.AddLoop(
-      /*start_index=*/0,
-      /*end_index=*/
-      tensorflow::Log2Ceiling64(dimension_to_sort_bound),
-      /*suffix=*/"sort_stages");
-  std::unique_ptr<ForLoop> mask_loop = loop_nest.AddLoop(
-      /*suffix=*/"mask",
-      /*start_index=*/keys_index.GetConstantWithIndexType(0),
-      /*end_index=*/stages_loop->GetIndVarValue());
-  std::unique_ptr<ForLoop> compare_loop = loop_nest.AddLoop(
-      /*start_index=*/0,
-      /*end_index=*/dimension_to_sort_bound,
-      /*suffix=*/"compare");
-
-  // Naive C++ code for the inner loops (without parallelization):
+  // Naive C++ code for the inner compare loop:
   //
-  // for (int64 stage = 0; stage < Log2Ceiling(dimension_to_sort_bound);
-  //     ++stage) {
-  //   int64 first_xor_mask = (1LL << (stage + 1)) - 1;
-  //   for (int64 i = 0; i < dimension_to_sort_bound; ++i) {
-  //     int64 j = i ^ first_xor_mask;
-  //     if (i < j && j < dimension_to_sort_bound) {
-  //       int64 min_key = std::min(keys[i], keys[j]);
-  //       keys[j] = std::max(keys[i], keys[j]);
-  //       keys[i] = min_key;
-  //     }
-  //   }
-  //   for (int64 mask = 0; mask < stage; ++mask) {
-  //     int64 later_xor_mask = (1LL << (stage - (mask + 1));
-  //     for (int64 i = 0; i < dimension_to_sort_bound; ++i) {
-  //       int64 j = i ^ later_xor_mask;
-  //       if (i < j && j < dimension_to_sort_bound) {
-  //         int64 min_key = std::min(keys[i], keys[j]);
-  //         keys[j] = std::max(keys[i], keys[j]);
-  //         keys[i] = min_key;
-  //       }
-  //     }
+  // for (int64 i = 0; i < dimension_to_sort_bound; ++i) {
+  //   int64 j = i ^ xor_mask;
+  //   if (i < j && j < dimension_to_sort_bound) {
+  //     int64 min_key = std::min(keys[i], keys[j]);
+  //     keys[j] = std::max(keys[i], keys[j]);
+  //     keys[i] = min_key;
   //   }
   // }
   //
   // This follows the algorithm described on Wikipedia:
   // https://en.wikipedia.org/wiki/Bitonic_sorter
 
-  SetToFirstInsertPoint(stages_loop->GetBodyBasicBlock(), b);
-  // The first xor mask of a stage is 2^(stage + 1) - 1.
-  auto first_xor_mask = b->CreateSub(
-      b->CreateShl(keys_index.GetConstantWithIndexType(1),
-                   b->CreateAdd(stages_loop->GetIndVarValue(),
-                                keys_index.GetConstantWithIndexType(1))),
-      keys_index.GetConstantWithIndexType(1));
-  std::unique_ptr<ForLoop> first_compare_loop = ForLoop::EmitForLoop(
-      /*prefix=*/"first_compare",
-      /*start_index=*/keys_index.GetConstantWithIndexType(0),
-      /*end_index=*/
-      keys_index.GetConstantWithIndexType(dimension_to_sort_bound),
-      /*step=*/keys_index.GetConstantWithIndexType(1),
-      /*b=*/b);
-
-  SetToFirstInsertPoint(first_compare_loop->GetBodyBasicBlock(), b);
-  // 'first_compare_loop' iterates through the 'dimension_to_sort'.
-  keys_index[dimension_to_sort] = first_compare_loop->GetIndVarValue();
-  compare_keys_index[dimension_to_sort] =
-      b->CreateXor(first_compare_loop->GetIndVarValue(), first_xor_mask);
-  EmitCompareLoop(dimension_to_sort, keys_index, compare_keys_index, keys_array,
-                  b);
-
-  SetToFirstInsertPoint(compare_loop->GetPreheaderBasicBlock(), b);
-  // The later masks of a stage are 2^(stage - (mask_loop_ind_var + 1)).
-  auto later_xor_mask = b->CreateShl(
-      keys_index.GetConstantWithIndexType(1),
-      b->CreateSub(stages_loop->GetIndVarValue(),
-                   b->CreateAdd(mask_loop->GetIndVarValue(),
-                                keys_index.GetConstantWithIndexType(1))));
-
-  SetToFirstInsertPoint(compare_loop->GetBodyBasicBlock(), b);
-  // 'compare_loop' iterates through the 'dimension_to_sort'.
-  keys_index[dimension_to_sort] = compare_loop->GetIndVarValue();
-  compare_keys_index[dimension_to_sort] =
-      b->CreateXor(compare_loop->GetIndVarValue(), later_xor_mask);
-  EmitCompareLoop(dimension_to_sort, keys_index, compare_keys_index, keys_array,
-                  b);
+  int64 dimension_to_sort_bound =
+      keys_array.GetShape().dimensions(dimension_to_sort);
+  Shape compare_shape = ShapeUtil::MakeShape(keys_shape.element_type(),
+                                             {dimension_to_sort_bound});
+  auto compare_loop_body_emitter =
+      [&](const IrArray::Index& compare_index) -> Status {
+    keys_index[dimension_to_sort] = compare_index[0];
+    compare_keys_index[dimension_to_sort] =
+        b->CreateXor(compare_index[0], xor_mask);
+    EmitCompareLoop(dimension_to_sort, keys_index, compare_keys_index,
+                    keys_array, values_array, b);
+    return Status::OK();
+  };
+  if (launch_dimensions != nullptr) {
+    TF_RETURN_IF_ERROR(gpu::ParallelLoopEmitter(compare_loop_body_emitter,
+                                                compare_shape,
+                                                *launch_dimensions, b)
+                           .EmitLoop(name));
+  } else {
+    TF_RETURN_IF_ERROR(LoopEmitter(compare_loop_body_emitter, compare_shape, b)
+                           .EmitLoop(name));
+  }
 
   // Set the IR builder insert point to the exit basic block of the outer most
   // loop. This ensures later instructions are inserted after this loop nest.

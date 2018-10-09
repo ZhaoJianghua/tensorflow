@@ -30,6 +30,11 @@ struct GrapplerItem;
 constexpr int64 kMemoryUnknown = -1ll;
 constexpr int64 kZeroMemory = 0ll;
 
+struct DeviceInfo {
+  double gigaops;     // Billions of operations executed per second.
+  double gb_per_sec;  // Bandwidth to main memory in GB per second.
+};
+
 // Holds the set of things we might want to estimate or measure in Grappler.
 // Always produce execution time. Other fields are optional depending on the
 // estimator being used.
@@ -109,8 +114,16 @@ struct Costs {
   int64 max_per_op_buffers;    // Sum of all buffers used by the ops.
   int64 max_per_op_streaming;  // Ignore largest input buffer, assuming it
                                // streams from main memory.
+
+  // Number of ops included in this Costs in total.
+  // Default initialized to be one.
+  int64 num_ops_total = 1;
   // If the time estimation is inaccurate.
   bool inaccurate = false;
+  // Number of ops that are estimated with unknown shapes.
+  int64 num_ops_with_unknown_shapes = 0;
+  // TODO(pcma): include a counter for total inaccurate ops and counters for
+  // other reasons causing the inaccuracy
 
   // Max possible memory usage per device.
   std::unordered_map<string, uint64> estimated_max_memory_per_device;

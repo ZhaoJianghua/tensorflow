@@ -64,6 +64,7 @@ enum class OperatorType : uint8 {
   kMaxPool,
   kFakeQuant,
   kMul,
+  kOneHot,
   kRandomUniform,
   kRange,
   kRank,
@@ -146,6 +147,10 @@ enum class OperatorType : uint8 {
   kAny,
   kLogicalAnd,
   kLogicalNot,
+  kLogicalOr,
+  kCTCBeamSearchDecoder,
+  kUnpack,
+  kZerosLike,
 };
 
 // Helper to deal with TensorFlow arrays using a different ordering of
@@ -292,6 +297,46 @@ struct Buffer : GenericBuffer {
   std::vector<DataType<A>> data;
 };
 
+class Shape {
+ public:
+  // For Shape, we stick to half-way encapsulation for now:
+  // we hide the raw dims_ member, but expose it raw by accessors
+  // because from some brainstorming, it's not at all easy to
+  // anticipate which flavor of more hermetic encapsulation would
+  // actually buy us future-proof-ness without being needlessly
+  // cumbersome.
+  Shape() {}
+  Shape(std::initializer_list<int> dim_list) : dims_(dim_list) {}
+
+  void ReplaceDims(std::initializer_list<int> dim_list) {
+    dims_ = std::vector<int>(dim_list);
+  }
+
+  const std::vector<int>& dims() const { return dims_; }
+  std::vector<int>* mutable_dims() { return &dims_; }
+  const int dimensions_count() const { return dims_.size(); }
+
+  // We still have that one convenience accessor to avoid
+  // the awkward double bracket issue:  shape.dims()[i].
+  int dims(int i) const {
+    // Always check for out-of-bounds accesses, even in optimized builds where
+    // standard assertions are disabled. Out-of-bounds access here is a common
+    // occurrence.
+    CHECK_GE(i, 0);
+    CHECK_GT(dims_.size(), i);
+    return dims_[i];
+  }
+
+  bool operator==(const Shape& comp) const {
+    return (this->dims_ == comp.dims());
+  }
+
+  bool operator!=(const Shape& comp) const { return !((*this) == comp); }
+
+ private:
+  std::vector<int> dims_;
+};
+
 // Base class for all operator classes.
 struct Operator {
   // Non-default-constructible: only OperatorType-specific subclass
@@ -330,6 +375,13 @@ struct Operator {
   // discarded as unused, even if from its 'outputs' member alone it
   // looks unused.
   bool unresolved_outputs = false;
+
+  // A serialized tensorflow::NodeDef string.
+  // The field is filled only when importing from TensorFlow.
+  // It's guaranteed to be filled for `TensorFlowUnsupportedOperator`.
+  // It's not guaranteed to be filled for other ops. Ops created by graph
+  // transformations won't have TensorFlow NodeDef.
+  string tensorflow_node_def;
 
  protected:
   // Constructor used by subclasses for specific OperatorType's.
@@ -396,6 +448,28 @@ struct ConvOperator : Operator {
   int dilation_height_factor = 1;
 };
 
+// CTCBeamSearchDecoder operator:
+//
+// Inputs:
+//   inputs[0]: required: the logits.
+//   inputs[1]: required: sequence length.
+//   inputs[2]: optional: beam width.
+//   inputs[3]: optional: top paths.
+//   inputs[4]: optional: merge repeated.
+//
+//  Outputs:
+//    outputs[0]: deocoded.
+//    outputs[1]: log probability.
+//
+// TensorFlow equivalent: CTCBeamSearchDecoder
+struct CTCBeamSearchDecoderOperator : Operator {
+  CTCBeamSearchDecoderOperator()
+      : Operator(OperatorType::kCTCBeamSearchDecoder) {}
+  int beam_width;
+  int top_paths;
+  bool merge_repeated = true;
+};
+
 // Depthwise-separable convolution operator.
 //
 // Inputs:
@@ -411,6 +485,11 @@ struct DepthwiseConvOperator : Operator {
   int stride_height = 0;
   int stride_width = 0;
   int depth_multiplier = 0;
+  // A dilation_rate of 0 is invalid and this field is an optional attribute.
+  // Thus initializing it to 1 to allow default conv behavior when the
+  // attribute is not present.
+  int dilation_width_factor = 1;
+  int dilation_height_factor = 1;
 };
 
 // Depth-to-space transform operator.
@@ -1463,12 +1542,15 @@ struct TensorFlowUnsupportedOperator : Operator {
 
   // The original TF operation type. Used for diagnostic purposes.
   string tensorflow_op;
-  // A serialized tensorflow::NodeDef string.
-  string tensorflow_node_def;
   // A boolean indicating if the unsupported op should be treated as quantized.
   bool quantized = false;
+  // A boolean indicating if the unsupported op output should allow float values
+  // in quantized mode.
+  bool support_output_type_float_in_quantized_op = false;
   // Output data types
   std::vector<ArrayDataType> output_data_types;
+  // Output shapes.
+  std::vector<Shape> output_shapes;
 };
 
 // Softmax activation function.
@@ -1700,8 +1782,9 @@ struct PowOperator : Operator {
 // Inputs[1]: required: reduction_indices.
 //
 // TensorFlow equivalent: tf.reduce_any.
-struct AnyOperator : Operator {
-  AnyOperator() : Operator(OperatorType::kAny) {}
+struct TensorFlowAnyOperator : Operator {
+  TensorFlowAnyOperator() : Operator(OperatorType::kAny) {}
+  std::vector<int> axis;
   bool keep_dims = false;
 };
 
@@ -1726,6 +1809,62 @@ struct LogicalNotOperator : Operator {
   LogicalNotOperator() : Operator(OperatorType::kLogicalNot) {}
 };
 
+// OneHot operator:
+//
+// Inputs:
+// Inputs[0]: required: indices.
+// Inputs[1]: required: depth.
+// Inputs[2]: required: on_value.
+// Inputs[3]: required: off_value.
+//
+// TensorFlow equivalent: OneHot.
+struct OneHotOperator : Operator {
+  enum Inputs {
+    INDICES_INPUT = 0,
+    DEPTH_INPUT = 1,
+    ON_VALUE_INPUT = 2,
+    OFF_VALUE_INPUT = 3,
+  };
+
+  OneHotOperator() : Operator(OperatorType::kOneHot) {}
+  int axis = -1;
+};
+
+// LogicalOr operator:
+//
+// Inputs:
+// Inputs[0]: required: A Bool tensor.
+// Inputs[1]: required: A Bool tensor.
+//
+// TensorFlow equivalent: LogicalOr.
+struct LogicalOrOperator : Operator {
+  LogicalOrOperator() : Operator(OperatorType::kLogicalOr) {}
+};
+
+// Unpack operator:
+//
+// Inputs:
+// Inputs[0]: required: A boolean input tensor.
+// Inputs[1]: required: reduction_indices.
+//
+// TensorFlow equivalent: tf.unstack.
+struct UnpackOperator : Operator {
+  UnpackOperator() : Operator(OperatorType::kUnpack) {}
+  int num;
+  int axis;
+  ArrayDataType dtype = ArrayDataType::kNone;
+};
+
+// ZerosLike operator:
+//
+// Inputs:
+// inputs[0]: required: the input array
+//
+// TensorFlow equivalent: tf.zeros_like
+struct TensorFlowZerosLikeOperator : Operator {
+  TensorFlowZerosLikeOperator() : Operator(OperatorType::kZerosLike) {}
+};
+
 // Alloc's are used for transient arrays only. An Alloc specifies which interval
 // of the "transient_data" workspace buffer passed to inference functions, is to
 // be used for the transient array at hand. The 'start' and 'end' values are
@@ -1738,46 +1877,6 @@ struct Alloc {
 inline bool operator<(const Alloc& a, const Alloc& b) {
   return a.start < b.start;
 }
-
-class Shape {
- public:
-  // For Shape, we stick to half-way encapsulation for now:
-  // we hide the raw dims_ member, but expose it raw by accessors
-  // because from some brainstorming, it's not at all easy to
-  // anticipate which flavor of more hermetic encapsulation would
-  // actually buy us future-proof-ness without being needlessly
-  // cumbersome.
-  Shape() {}
-  Shape(std::initializer_list<int> dim_list) : dims_(dim_list) {}
-
-  void ReplaceDims(std::initializer_list<int> dim_list) {
-    dims_ = std::vector<int>(dim_list);
-  }
-
-  const std::vector<int>& dims() const { return dims_; }
-  std::vector<int>* mutable_dims() { return &dims_; }
-  const int dimensions_count() const { return dims_.size(); }
-
-  // We still have that one convenience accessor to avoid
-  // the awkward double bracket issue:  shape.dims()[i].
-  int dims(int i) const {
-    // Always check for out-of-bounds accesses, even in optimized builds where
-    // standard assertions are disabled. Out-of-bounds access here is a common
-    // occurrence.
-    CHECK_GE(i, 0);
-    CHECK_GT(dims_.size(), i);
-    return dims_[i];
-  }
-
-  bool operator==(const Shape& comp) const {
-    return (this->dims_ == comp.dims());
-  }
-
-  bool operator!=(const Shape& comp) const { return !((*this) == comp); }
-
- private:
-  std::vector<int> dims_;
-};
 
 // Array represents an array (either a constant parameter array or an
 // activations array) in a Model.
@@ -1990,6 +2089,7 @@ class Model {
     }
   }
   const ArrayMap& GetArrayMap() const { return arrays; }
+  ArrayMap& GetMutableArrayMap() { return arrays; }
 
   int64 ArithmeticOpsCount() const { return ops_count; }
 
@@ -2009,7 +2109,7 @@ class Model {
   std::size_t transient_data_size = 0;
   // For code-generation only: required alignment of the transient_data buffer
   std::size_t transient_data_alignment = 0;
-  // Arithmatic operations performed in the model.
+  // Arithmetic operations performed in the model.
   int64 ops_count = 0;
 
  private:
